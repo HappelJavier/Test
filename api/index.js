@@ -33,5 +33,6 @@ app.use((req, res, next) => {
 
 app.use("/trivia", triviaRoutes);
 
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`✅ Backend running on port ${PORT}`));
+/* const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`✅ Backend running on port ${PORT}`)); */
+module.exports = app;

@@ -1,7 +1,8 @@
 {
   "name": "quizkyot",
   "version": "1.0.0",
-  "main": "index.js",
+  "description": "Backend para la extensión de Twitch QuizKyot",
+  "main": "api/index.js",
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js"
