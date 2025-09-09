@@ -10,6 +10,89 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// --- Twitch API Helpers ---
+
+let twitchAppToken = {
+    access_token: null,
+    expires_at: null,
+};
+
+// Fetches and caches a Twitch App Access Token
+async function getAppAccessToken() {
+    const now = Date.now();
+    if (twitchAppToken.access_token && twitchAppToken.expires_at > now) {
+        return twitchAppToken.access_token;
+    }
+
+    const clientId = process.env.TWITCH_CLIENT_ID;
+    const clientSecret = process.env.TWITCH_CLIENT_SECRET;
+
+    if (!clientId || !clientSecret) {
+        console.error("Twitch Client ID or Client Secret is not configured in environment variables.");
+        return null;
+    }
+
+    try {
+        const response = await fetch('https://id.twitch.tv/oauth2/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: `client_id=${clientId}&client_secret=${clientSecret}&grant_type=client_credentials`,
+        });
+
+        if (!response.ok) {
+            throw new Error(`Failed to get Twitch token: ${response.statusText}`);
+        }
+
+        const data = await response.json();
+        const expiresInMs = (data.expires_in - 60) * 1000; // Subtract 60s for safety margin
+
+        twitchAppToken = {
+            access_token: data.access_token,
+            expires_at: now + expiresInMs,
+        };
+
+        console.log("Successfully fetched new Twitch App Access Token.");
+        return twitchAppToken.access_token;
+
+    } catch (error) {
+        console.error("Error fetching Twitch App Access Token:", error);
+        return null;
+    }
+}
+
+// Fetches a user's display name from their Twitch ID
+async function getTwitchDisplayName(twitchUserId) {
+    const token = await getAppAccessToken();
+    const clientId = process.env.TWITCH_CLIENT_ID;
+
+    if (!token || !clientId) {
+        return `User_${twitchUserId}`; // Fallback
+    }
+
+    try {
+        const response = await fetch(`https://api.twitch.tv/helix/users?id=${twitchUserId}`, {
+            headers: {
+                'Client-ID': clientId,
+                'Authorization': `Bearer ${token}`,
+            },
+        });
+
+        if (!response.ok) {
+            throw new Error(`Twitch API request failed: ${response.statusText}`);
+        }
+
+        const data = await response.json();
+        if (data.data && data.data.length > 0) {
+            return data.data[0].display_name;
+        }
+        return `User_${twitchUserId}`; // Fallback if user not found
+
+    } catch (error) {
+        console.error(`Error fetching display name for ${twitchUserId}:`, error);
+        return `User_${twitchUserId}`; // Fallback on error
+    }
+}
+
 // --- In-Memory State for Live Game ---
 // The actual questions and quizzes are now in the DB.
 // This object only holds the state of a currently active quiz session.
@@ -292,22 +375,19 @@ app.post("/api/quiz/next-question", async (req, res) => {
         const { rows: questionsInQuiz } = await db.query(quizQuestionsQuery, [currentQuizSession.quizId]);
 
         if (currentQuizSession.questionIndex >= questionsInQuiz.length) {
-            // Quiz is over
-            io.emit("quiz-end", { finalScores: currentQuizSession.userScores });
-            console.log(`--- Quiz ${currentQuizSession.quizId} ended ---`);
+            // Quiz is over, time to show final results.
+            console.log(`--- Quiz ${currentQuizSession.quizId} is over, showing final results. ---`);
+            io.emit("show-final-results", { finalScores: currentQuizSession.userScores });
 
-            // Update end_time for the quiz instance
-            if (currentQuizSession.quizInstanceId) {
-                await db.query('UPDATE quiz_instances SET end_time = CURRENT_TIMESTAMP WHERE id = $1', [currentQuizSession.quizInstanceId]);
-            }
-
-            currentQuizSession = { quizId: null, questionIndex: 0, userScores: {}, currentQuestion: null, timeout: null }; // Reset state
-            return res.status(200).json({ message: "Quiz finished." });
+            // DO NOT reset the session here. The streamer must manually click "End Quiz".
+            return res.status(200).json({ message: "Quiz finished. Displaying final results." });
         }
 
         const nextQuestion = questionsInQuiz[currentQuizSession.questionIndex];
         currentQuizSession.currentQuestion = nextQuestion; // Store full question data for scoring
         currentQuizSession.currentQuestion.answers = {}; // Reset answers for the new round
+        currentQuizSession.currentQuestion.receivedAnswerCount = 0; // Initialize received answer count
+        currentQuizSession.currentQuestion.expectedAnswerCount = activeParticipantSocketIds.size; // Set expected answers
 
         // Prepare a clean version of the question for clients (without correct_option)
         const questionForClients = {
@@ -319,15 +399,20 @@ app.post("/api/quiz/next-question", async (req, res) => {
 
         io.emit("start-question", questionForClients);
         console.log(`--- Question ${nextQuestion.id} started for Quiz ${currentQuizSession.quizId} ---`);
+        console.log(`Expecting ${currentQuizSession.currentQuestion.expectedAnswerCount} answers.`);
 
         // Increment index for the next call
         currentQuizSession.questionIndex++;
 
-        // Set timeout for the round to end
-        if (currentQuizSession.timeout) clearTimeout(currentQuizSession.timeout);
-        currentQuizSession.timeout = setTimeout(() => {
+        // Set a submission window timeout for the round to end unconditionally
+        const GRACE_PERIOD_SECONDS = 5; // Additional time to wait for answers after timeLimit
+        const submissionWindow = (nextQuestion.time_limit + GRACE_PERIOD_SECONDS) * 1000;
+
+        if (currentQuizSession.submissionWindowTimeout) clearTimeout(currentQuizSession.submissionWindowTimeout);
+        currentQuizSession.submissionWindowTimeout = setTimeout(() => {
+            console.log("Submission window closed. Ending round.");
             endRound();
-        }, nextQuestion.time_limit * 1000);
+        }, submissionWindow);
 
         res.status(200).json({ message: `Question ${nextQuestion.id} started.` });
 
@@ -337,69 +422,146 @@ app.post("/api/quiz/next-question", async (req, res) => {
     }
 });
 
-const endRound = async () => {
-    if (!currentQuizSession.quizId || !currentQuizSession.currentQuestion) {
-        return; // No active round to end
+function resetQuizSession() {
+    if (currentQuizSession.timeout) {
+        clearTimeout(currentQuizSession.timeout);
+    }
+    currentQuizSession = {
+        quizId: null,
+        quizInstanceId: null,
+        questionIndex: 0,
+        userScores: {},
+        currentQuestion: null,
+        timeout: null,
+    };
+    console.log("Quiz session state has been reset.");
+}
+
+app.post("/api/quiz/deactivate", async (req, res) => {
+    if (!currentQuizSession.quizId) {
+        return res.status(400).json({ error: "No quiz is currently active." });
     }
 
-    console.log(`--- Round Ended for Question ${currentQuizSession.currentQuestion.id} ---`);
+    try {
+        const quizId = currentQuizSession.quizId;
+        console.log(`--- Manually ending quiz ${quizId} ---`);
 
+        // Update end_time for the quiz instance in the database
+        if (currentQuizSession.quizInstanceId) {
+            await db.query('UPDATE quiz_instances SET end_time = CURRENT_TIMESTAMP WHERE id = $1', [currentQuizSession.quizInstanceId]);
+        }
+
+        // Emit a quiz-end event to all clients
+        io.emit("quiz-end", { finalScores: currentQuizSession.userScores, manualStop: true });
+
+        // Reset the in-memory state
+        resetQuizSession();
+
+        res.status(200).json({ message: `Quiz ${quizId} deactivated successfully.` });
+
+    } catch (err) {
+        console.error("Error deactivating quiz:", err);
+        res.status(500).json({ error: "Failed to deactivate quiz." });
+    }
+});
+
+const calculateRoundResults = (answers, correctOption, timeLimit) => {
     const roundResults = [];
-    const maxPoints = 1000;
-    const timePenaltyFactor = 50;
-
-    const answers = currentQuizSession.currentQuestion.answers || {};
 
     for (const userId in answers) {
         const answer = answers[userId];
-        const isCorrect = currentQuizSession.currentQuestion.correct_option === answer.selectedOption;
+        const isCorrect = correctOption === answer.selectedOption;
 
         let points = 0;
-        const potentialPoints = Math.max(10, maxPoints - (answer.responseTime * timePenaltyFactor));
 
-        if (isCorrect) {
-            points = potentialPoints;
+        if (answer.selectedOption === -1) { // No answer submitted
+            points = 0;
+        } else if (isCorrect) {
+            // responseTime is now the points (remaining time in ms)
+            points = answer.responseTime;
         } else {
-            points = -Math.floor(potentialPoints / 2);
+            // Incorrect answer, points are negative
+            points = -answer.responseTime;
         }
 
-        // Update total score for the session in memory
-        if (!currentQuizSession.userScores[userId]) currentQuizSession.userScores[userId] = 0;
-        currentQuizSession.userScores[userId] += points;
-
-        // Save the detailed response to the database
-        const responseQuery = `
-            INSERT INTO responses(quiz_instance_id, quiz_id, question_id, user_id, selected_option, response_time_ms, score, is_correct)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8);
-        `;
-        await db.query(responseQuery, [
-            currentQuizSession.quizInstanceId, // Use quiz instance ID
-            currentQuizSession.quizId,
-            currentQuizSession.currentQuestion.id,
-            userId, // This is the internal DB id, not the twitch_user_id
-            answer.selectedOption,
-            Math.floor(Number(answer.responseTime) * 1000),
-            points,
-            isCorrect
-        ]);
-
         roundResults.push({
-            twitchUserId: answer.twitchUserId, // Send twitchId to front
-            points
+            userId: userId, // Keep internal ID for processing
+            twitchUserId: answer.twitchUserId,
+            displayName: answer.displayName,
+            points: Math.floor(points) // Ensure points are integer
         });
     }
 
-    roundResults.sort((a, b) => b.points - a.points);
-    const leaderboard = roundResults.slice(0, 5);
+    return roundResults.sort((a, b) => b.points - a.points);
+};
 
+const endRound = async () => {
+    if (!currentQuizSession.quizId || !currentQuizSession.currentQuestion) return;
+
+    console.log(`--- Round Ended for Question ${currentQuizSession.currentQuestion.id} ---`);
+
+    const answers = currentQuizSession.currentQuestion.answers || {};
+    const finalRoundResults = calculateRoundResults(
+        answers,
+        currentQuizSession.currentQuestion.correct_option,
+        currentQuizSession.currentQuestion.time_limit // Pass time_limit
+    );
+
+    // Use a transaction to ensure all or nothing
+    const client = await db.getClient();
+    try {
+        await client.query('BEGIN');
+
+        for (const result of finalRoundResults) {
+            const answer = answers[result.userId];
+            if (!answer) continue;
+
+            // Update total score in memory
+            if (!currentQuizSession.userScores[result.userId]) {
+                currentQuizSession.userScores[result.userId] = {
+                    score: 0,
+                    twitchUserId: result.twitchUserId,
+                    displayName: result.displayName
+                };
+            }
+            currentQuizSession.userScores[result.userId].score += result.points;
+
+            // Save response to DB
+            const responseQuery = `
+                INSERT INTO responses(quiz_instance_id, quiz_id, question_id, user_id, selected_option, response_time_ms, score, is_correct)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8);
+            `;
+            await client.query(responseQuery, [
+                currentQuizSession.quizInstanceId,
+                currentQuizSession.quizId,
+                currentQuizSession.currentQuestion.id,
+                result.userId,
+                answer.selectedOption,
+                Math.floor(Number(answer.responseTime) * 1000),
+                result.points,
+                result.points > 0
+            ]);
+        }
+
+        await client.query('COMMIT');
+
+    } catch (e) {
+        await client.query('ROLLBACK');
+        console.error('Error during end-of-round transaction:', e);
+    } finally {
+        client.release();
+    }
+
+    // Emit final round results and updated overall scores
     io.emit("round-end", {
-        leaderboard,
+        roundResults: finalRoundResults,
+        userScores: currentQuizSession.userScores,
         correctOption: currentQuizSession.currentQuestion.correct_option
     });
 
-    // Clear question-specific data for the next round
     currentQuizSession.currentQuestion = null;
-    if (currentQuizSession.timeout) clearTimeout(currentQuizSession.timeout);
+    if (currentQuizSession.submissionWindowTimeout) clearTimeout(currentQuizSession.submissionWindowTimeout);
+    currentQuizSession.submissionWindowTimeout = null; // Clear the timeout reference
 };
 
 // --- WebSocket (Socket.io) Setup ---
@@ -411,30 +573,63 @@ const io = new Server(server, {
     }
 });
 
-const findOrCreateUser = async (twitchUserId) => {
+let controlPanelSocketId = null; // To store the socket ID of the control panel
+const activeParticipantSocketIds = new Set(); // To store socket IDs of active players
+
+const findOrCreateUser = async (twitchUserId, displayName) => {
     // First, try to find the user
-    let user = await db.query('SELECT id FROM users WHERE twitch_user_id = $1', [twitchUserId]);
-    if (user.rows.length > 0) {
-        return user.rows[0]; // User found, return it
+    let userResult = await db.query('SELECT id FROM users WHERE twitch_user_id = $1', [twitchUserId]);
+
+    if (userResult.rows.length > 0) {
+        // User found, update display_name in case it changed, and return user
+        const user = userResult.rows[0];
+        await db.query('UPDATE users SET display_name = $1 WHERE id = $2', [displayName, user.id]);
+        return user;
+    } else {
+        // If not found, create a new user
+        const newUserResult = await db.query(
+            'INSERT INTO users(twitch_user_id, display_name) VALUES($1, $2) RETURNING id',
+            [twitchUserId, displayName]
+        );
+        const newUser = newUserResult.rows[0];
+        console.log(`New user created: ${displayName} (Twitch ID: ${twitchUserId})`);
+        return newUser;
     }
-    // If not found, create a new user
-    user = await db.query('INSERT INTO users(twitch_user_id) VALUES($1) RETURNING id', [twitchUserId]);
-    console.log(`New user created with Twitch ID: ${twitchUserId}`);
-    return user.rows[0]; // Return the newly created user
 };
 
 io.on("connection", (socket) => {
     console.log(`\nA client connected: ${socket.id}`);
 
+    // Add to active participants if not control panel
+    if (socket.id !== controlPanelSocketId) { // Initial check, will be updated by register-control-panel
+        activeParticipantSocketIds.add(socket.id);
+        console.log(`Participant connected: ${socket.id}. Total participants: ${activeParticipantSocketIds.size}`);
+    }
+
+    socket.on('register-control-panel', () => {
+        // Remove from active participants if it was initially added as one
+        if (activeParticipantSocketIds.has(socket.id)) {
+            activeParticipantSocketIds.delete(socket.id);
+            console.log(`Control Panel ${socket.id} removed from participants. Total participants: ${activeParticipantSocketIds.size}`);
+        }
+        controlPanelSocketId = socket.id;
+        console.log(`Control Panel registered with ID: ${controlPanelSocketId}`);
+    });
+
+
     socket.on('submit-answer', async (data) => {
         const { questionId, selectedOption, responseTime, twitchUserId } = data;
 
         // --- Validations ---
-        if (!currentQuizSession.currentQuestion || currentQuizSession.currentQuestion.id !== questionId) {
-            return; // Answer is not for the current question, ignore.
+        if (!currentQuizSession.quizId || !currentQuizSession.currentQuestion || currentQuizSession.currentQuestion.id !== questionId) {
+            return; // Answer is not for the current question, or no quiz/question active, ignore.
         }
 
-        const user = await findOrCreateUser(twitchUserId);
+        // Fetch display name from Twitch API first
+        const displayName = await getTwitchDisplayName(twitchUserId);
+
+        // Find or create the user with their display name
+        const user = await findOrCreateUser(twitchUserId, displayName);
         if (!user) return; // Should not happen
 
         // Check if user has already answered this question in memory
@@ -446,15 +641,47 @@ io.on("connection", (socket) => {
         currentQuizSession.currentQuestion.answers[user.id] = {
             selectedOption,
             responseTime,
-            twitchUserId // Keep this for the leaderboard response
+            twitchUserId, // Keep this for the leaderboard response
+            displayName // Also store displayName for potential future use
         };
-        console.log(`Answer received from user ${user.id} (Twitch: ${twitchUserId})`);
+        currentQuizSession.currentQuestion.receivedAnswerCount++; // Increment received answer count
+
+        // --- Real-time update for control panel ---
+        if (currentQuizSession.currentQuestion) {
+            const liveResults = calculateRoundResults(
+                currentQuizSession.currentQuestion.answers,
+                currentQuizSession.currentQuestion.correct_option
+            );
+            if (controlPanelSocketId) {
+                io.to(controlPanelSocketId).emit("live-round-update", { roundResults: liveResults });
+            } else {
+                console.warn("Control Panel not registered. Cannot send live-round-update.");
+            }
+        }
+
+        console.log(`Answer received from ${displayName} (Twitch: ${twitchUserId}). Answers received: ${currentQuizSession.currentQuestion.receivedAnswerCount}/${currentQuizSession.currentQuestion.expectedAnswerCount}`);
+
+        // Log when all expected answers have been received
+        if (currentQuizSession.currentQuestion.receivedAnswerCount >= currentQuizSession.currentQuestion.expectedAnswerCount) {
+            console.log("All expected answers received. Waiting for submission window to close.");
+        }
     });
 
     socket.on("disconnect", () => {
         console.log(`Client disconnected: ${socket.id}`);
+        if (socket.id === controlPanelSocketId) {
+            controlPanelSocketId = null;
+            console.log("Control Panel disconnected. controlPanelSocketId cleared.");
+        } else {
+            activeParticipantSocketIds.delete(socket.id);
+            console.log(`Participant disconnected: ${socket.id}. Total participants: ${activeParticipantSocketIds.size}`);
+        }
     });
+
 });
+
+
+
 
 
 // --- Server Initialization ---

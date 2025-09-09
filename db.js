@@ -16,4 +16,5 @@ const pool = new Pool({
 // This is a simple way to centralize database access.
 module.exports = {
     query: (text, params) => pool.query(text, params),
+    getClient: () => pool.connect(),
 };
