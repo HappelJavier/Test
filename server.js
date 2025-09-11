@@ -62,17 +62,24 @@ async function getAppAccessToken() {
 
 // Fetches a user's display name from their Twitch ID
 async function getTwitchDisplayName(twitchUserId) {
+    // Remove 'U' prefix if present
+    let cleanedTwitchUserId = twitchUserId;
+    if (typeof twitchUserId === 'string' && twitchUserId.startsWith('U')) {
+        cleanedTwitchUserId = twitchUserId.substring(1);
+        console.log(`getTwitchDisplayName: Removed 'U' prefix. Original: ${twitchUserId}, Cleaned: ${cleanedTwitchUserId}`);
+    }
+
     const token = await getAppAccessToken();
     const clientId = process.env.TWITCH_CLIENT_ID;
 
     if (!token || !clientId) {
         console.error(`getTwitchDisplayName: Missing token or clientId. Token: ${token ? 'present' : 'missing'}, ClientID: ${clientId ? 'present' : 'missing'}`);
-        return `User_${twitchUserId}`; // Fallback
+        return `User_${cleanedTwitchUserId}`; // Fallback with cleaned ID
     }
 
     try {
-        console.log(`getTwitchDisplayName: Fetching display name for ${twitchUserId} with Client-ID: ${clientId}, Token: ${token.substring(0, 10)}...`); // Log token partially
-        const response = await fetch(`https://api.twitch.tv/helix/users?id=${twitchUserId}`, {
+        console.log(`getTwitchDisplayName: Fetching display name for ${cleanedTwitchUserId} with Client-ID: ${clientId}, Token: ${token.substring(0, 10)}...`); // Log token partially
+        const response = await fetch(`https://api.twitch.tv/helix/users?id=${cleanedTwitchUserId}`, { // Use cleaned ID
             headers: {
                 'Client-ID': clientId,
                 'Authorization': `Bearer ${token}`,
