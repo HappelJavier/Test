@@ -66,10 +66,12 @@ async function getTwitchDisplayName(twitchUserId) {
     const clientId = process.env.TWITCH_CLIENT_ID;
 
     if (!token || !clientId) {
+        console.error(`getTwitchDisplayName: Missing token or clientId. Token: ${token ? 'present' : 'missing'}, ClientID: ${clientId ? 'present' : 'missing'}`);
         return `User_${twitchUserId}`; // Fallback
     }
 
     try {
+        console.log(`getTwitchDisplayName: Fetching display name for ${twitchUserId} with Client-ID: ${clientId}, Token: ${token.substring(0, 10)}...`); // Log token partially
         const response = await fetch(`https://api.twitch.tv/helix/users?id=${twitchUserId}`, {
             headers: {
                 'Client-ID': clientId,
@@ -78,17 +80,21 @@ async function getTwitchDisplayName(twitchUserId) {
         });
 
         if (!response.ok) {
+            const errorBody = await response.text(); // Read error response body
+            console.error(`getTwitchDisplayName: Twitch API request failed for ${twitchUserId}. Status: ${response.status}, StatusText: ${response.statusText}, Body: ${errorBody}`);
             throw new Error(`Twitch API request failed: ${response.statusText}`);
         }
 
         const data = await response.json();
         if (data.data && data.data.length > 0) {
+            console.log(`getTwitchDisplayName: Successfully fetched display name for ${twitchUserId}: ${data.data[0].display_name}`);
             return data.data[0].display_name;
         }
+        console.warn(`getTwitchDisplayName: User ${twitchUserId} not found in Twitch API response.`);
         return `User_${twitchUserId}`; // Fallback if user not found
 
     } catch (error) {
-        console.error(`Error fetching display name for ${twitchUserId}:`, error);
+        console.error(`getTwitchDisplayName: Error in catch block for ${twitchUserId}:`, error);
         return `User_${twitchUserId}`; // Fallback on error
     }
 }
