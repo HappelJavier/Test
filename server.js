@@ -312,8 +312,10 @@ app.post("/api/quiz/activate", async (req, res) => {
     if (!quizId) {
         return res.status(400).json({ error: "quizId is required" });
     }
+    // If a quiz is already active, reset it first to ensure a clean slate
     if (currentQuizSession.quizId) {
-        return res.status(409).json({ error: `Quiz ${currentQuizSession.quizId} is already active.` });
+        console.log(`Resetting previous quiz ${currentQuizSession.quizId} before activating new one.`);
+        resetQuizSession();
     }
 
     try {
@@ -379,7 +381,10 @@ app.post("/api/quiz/next-question", async (req, res) => {
             console.log(`--- Quiz ${currentQuizSession.quizId} is over, showing final results. ---`);
             io.emit("show-final-results", { finalScores: currentQuizSession.userScores });
 
-            // DO NOT reset the session here. The streamer must manually click "End Quiz".
+            // Reset the session immediately after showing final results
+            // This prepares the backend for a new quiz activation
+
+
             return res.status(200).json({ message: "Quiz finished. Displaying final results." });
         }
 
@@ -391,6 +396,7 @@ app.post("/api/quiz/next-question", async (req, res) => {
 
         // Prepare a clean version of the question for clients (without correct_option)
         const questionForClients = {
+            quizId: currentQuizSession.quizId,
             id: nextQuestion.id,
             text: nextQuestion.text,
             options: nextQuestion.options,
@@ -423,8 +429,8 @@ app.post("/api/quiz/next-question", async (req, res) => {
 });
 
 function resetQuizSession() {
-    if (currentQuizSession.timeout) {
-        clearTimeout(currentQuizSession.timeout);
+    if (currentQuizSession.submissionWindowTimeout) { // Clear the new timeout
+        clearTimeout(currentQuizSession.submissionWindowTimeout);
     }
     currentQuizSession = {
         quizId: null,
@@ -432,13 +438,14 @@ function resetQuizSession() {
         questionIndex: 0,
         userScores: {},
         currentQuestion: null,
-        timeout: null,
+        submissionWindowTimeout: null, // Ensure this is reset
     };
     console.log("Quiz session state has been reset.");
 }
 
 app.post("/api/quiz/deactivate", async (req, res) => {
     if (!currentQuizSession.quizId) {
+        resetQuizSession();
         return res.status(400).json({ error: "No quiz is currently active." });
     }
 
@@ -507,6 +514,18 @@ const endRound = async () => {
         currentQuizSession.currentQuestion.time_limit // Pass time_limit
     );
 
+    // Count votes for each option
+    const optionVoteCounts = { 0: 0, 1: 0, 2: 0, 3: 0, '-1': 0 }; // Initialize counts for options and no answer
+    for (const userId in answers) {
+        const selectedOption = answers[userId].selectedOption;
+        if (optionVoteCounts.hasOwnProperty(selectedOption)) {
+            optionVoteCounts[selectedOption]++;
+        } else {
+            // Handle unexpected selectedOption values, though -1 should cover no answer
+            console.warn(`Unexpected selectedOption value: ${selectedOption}`);
+        }
+    }
+
     // Use a transaction to ensure all or nothing
     const client = await db.getClient();
     try {
@@ -556,7 +575,8 @@ const endRound = async () => {
     io.emit("round-end", {
         roundResults: finalRoundResults,
         userScores: currentQuizSession.userScores,
-        correctOption: currentQuizSession.currentQuestion.correct_option
+        correctOption: currentQuizSession.currentQuestion.correct_option,
+        optionVoteCounts: optionVoteCounts // Add vote counts
     });
 
     currentQuizSession.currentQuestion = null;
