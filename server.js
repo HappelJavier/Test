@@ -779,12 +779,21 @@ io.on("connection", (socket) => {
     socket.on('merge-user', async ({ opaqueId, realUserId }) => {
         try {
             if (!opaqueId || !realUserId) return;
-            // Buscar usuarios en la base de datos
-            const anonUserRes = await db.query('SELECT id FROM users WHERE twitch_user_id = $1', [opaqueId]);
-            const realUserRes = await db.query('SELECT id FROM users WHERE twitch_user_id = $1', [realUserId]);
-            if (anonUserRes.rows.length === 0 || realUserRes.rows.length === 0) {
-                console.log(`merge-user: No se encontraron ambos usuarios (opaqueId: ${opaqueId}, realUserId: ${realUserId})`);
-                return;
+            // Buscar o crear usuario anónimo
+            let anonUserRes = await db.query('SELECT id FROM users WHERE twitch_user_id = $1', [opaqueId]);
+            if (anonUserRes.rows.length === 0) {
+                const anon = await createAnonymousUser(opaqueId);
+                anonUserRes = { rows: [{ id: anon.dbUserId }] };
+            }
+            // Buscar o crear usuario autenticado
+            let realUserRes = await db.query('SELECT id FROM users WHERE twitch_user_id = $1', [realUserId]);
+            if (realUserRes.rows.length === 0) {
+                const displayName = await getTwitchDisplayName(realUserId);
+                const newUser = await db.query(
+                    'INSERT INTO users(twitch_user_id, display_name) VALUES($1, $2) RETURNING id',
+                    [realUserId, displayName]
+                );
+                realUserRes = { rows: [{ id: newUser.rows[0].id }] };
             }
             const anonDbUserId = anonUserRes.rows[0].id;
             const realDbUserId = realUserRes.rows[0].id;
