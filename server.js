@@ -653,6 +653,10 @@ io.on("connection", (socket) => {
     socket.on('submit-answer', async (data) => {
         const { questionId, selectedOption, responseTime, twitchUserId } = data;
 
+        if (responseTime === 0 || selectedOption === -1) {
+            return;
+        }
+
         // --- Validations ---
         if (!currentQuizSession.quizId || !currentQuizSession.currentQuestion || currentQuizSession.currentQuestion.id !== questionId) {
             return; // Answer is not for the current question, or no quiz/question active, ignore.
