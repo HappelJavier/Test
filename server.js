@@ -10,6 +10,11 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// --- User Session Management ---
+const socketUserMap = new Map(); // Maps socket.id -> { dbUserId, isAnonymous, anonymousNumber }
+const usedAnonymousNumbers = new Set();
+let nextAnonymousNumber = 1;
+
 // --- Twitch API Helpers ---
 
 let twitchAppToken = {
@@ -206,6 +211,22 @@ app.delete("/api/questions/:id", async (req, res) => {
     }
 });
 
+// Delete a quiz
+app.delete("/api/quiz/:id", async (req, res) => {
+    const { id } = req.params;
+
+    try {
+        const { rowCount } = await db.query('DELETE FROM quizzes WHERE id = $1', [id]);
+        if (rowCount === 0) {
+            return res.status(404).json({ error: "Quiz not found." });
+        }
+        res.status(200).json({ message: "Quiz deleted successfully." });
+    } catch (err) {
+        console.error(`Error deleting quiz ${id}:`, err);
+        res.status(500).json({ error: "Failed to delete quiz." });
+    }
+});
+
 // Get status of the current active quiz
 app.get("/api/quiz/status", async (req, res) => {
     if (!currentQuizSession.quizId) {
@@ -321,7 +342,7 @@ app.post("/api/quizzes", async (req, res) => {
 
 // Activate a quiz, making it the currently active one.
 app.post("/api/quiz/activate", async (req, res) => {
-    const { quizId } = req.body;
+    const { quizId, name } = req.body;
     if (!quizId) {
         return res.status(400).json({ error: "quizId is required" });
     }
@@ -361,7 +382,7 @@ app.post("/api/quiz/activate", async (req, res) => {
 
         await db.query('COMMIT');
 
-        io.emit("quiz-ready", { quizId });
+        io.emit("quiz-ready", { quizId: quizId, name: name });
         console.log(`--- Quiz ${quizId} activated (Instance: ${newQuizInstanceId}) ---`);
         res.status(200).json({ message: `Quiz ${quizId} activated. Ready to start first question.` });
 
@@ -417,6 +438,16 @@ app.post("/api/quiz/next-question", async (req, res) => {
         };
 
         io.emit("start-question", questionForClients);
+
+        // Send a special event to the control panel with the correct answer
+        if (controlPanelSocketId) {
+            const questionForControlPanel = {
+                ...questionForClients,
+                correctOption: nextQuestion.correct_option, // Add the correct option
+            };
+            io.to(controlPanelSocketId).emit("start-question-control-panel", questionForControlPanel);
+        }
+
         console.log(`--- Question ${nextQuestion.id} started for Quiz ${currentQuizSession.quizId} ---`);
         console.log(`Expecting ${currentQuizSession.currentQuestion.expectedAnswerCount} answers.`);
 
@@ -609,24 +640,107 @@ const io = new Server(server, {
 let controlPanelSocketId = null; // To store the socket ID of the control panel
 const activeParticipantSocketIds = new Set(); // To store socket IDs of active players
 
+async function initializeAnonymousUserTracking() {
+    console.log("Initializing anonymous user tracking...");
+    try {
+        const { rows } = await db.query("SELECT display_name FROM users WHERE twitch_user_id LIKE 'U%' AND display_name LIKE 'User %'");
+        for (const row of rows) {
+            const match = row.display_name.match(/^User (\d+)$/);
+            if (match && match[1]) {
+                const num = parseInt(match[1], 10);
+                usedAnonymousNumbers.add(num);
+            }
+        }
+        while (usedAnonymousNumbers.has(nextAnonymousNumber)) {
+            nextAnonymousNumber++;
+        }
+        console.log("Anonymous user tracking initialized. Used numbers:", Array.from(usedAnonymousNumbers));
+        console.log("Next available anonymous number:", nextAnonymousNumber);
+    } catch (error) {
+        console.error("Error initializing anonymous user tracking:", error);
+    }
+}
+
+async function findNextAvailableAnonymousNumber() {
+    while (usedAnonymousNumbers.has(nextAnonymousNumber)) {
+        nextAnonymousNumber++;
+    }
+    return nextAnonymousNumber;
+}
+
+async function createAnonymousUser(twitchUserId) {
+    const anonymousNumber = await findNextAvailableAnonymousNumber();
+    const displayName = `User ${anonymousNumber}`;
+
+    const { rows } = await db.query(
+        'INSERT INTO users(twitch_user_id, display_name) VALUES($1, $2) RETURNING id, display_name',
+        [twitchUserId, displayName]
+    );
+    const newUser = rows[0];
+
+    usedAnonymousNumbers.add(anonymousNumber);
+    console.log(`Created anonymous user: ${displayName} (Twitch ID: ${twitchUserId})`);
+
+    return {
+        dbUserId: newUser.id,
+        displayName: newUser.display_name,
+        anonymousNumber: anonymousNumber,
+    };
+}
+
+async function mergeUsers(anonymousDbUserId, authenticatedDbUserId) {
+    console.log(`Merging user ID ${anonymousDbUserId} into ${authenticatedDbUserId}`);
+    const client = await db.getClient();
+    try {
+        await client.query('BEGIN');
+        await client.query('UPDATE responses SET user_id = $1 WHERE user_id = $2', [authenticatedDbUserId, anonymousDbUserId]);
+        await client.query('DELETE FROM users WHERE id = $1', [anonymousDbUserId]);
+        await client.query('COMMIT');
+        console.log(`Successfully merged user data in DB.`);
+    } catch (e) {
+        await client.query('ROLLBACK');
+        console.error(`Error merging users in DB:`, e);
+    } finally {
+        client.release();
+    }
+}
+
+function mergeInMemoryData(anonymousDbUserId, authenticatedDbUserId) {
+    console.log(`Merging in-memory data for user ID ${anonymousDbUserId} into ${authenticatedDbUserId}`);
+    if (currentQuizSession.userScores[anonymousDbUserId]) {
+        const anonymousScore = currentQuizSession.userScores[anonymousDbUserId].score || 0;
+        if (!currentQuizSession.userScores[authenticatedDbUserId]) {
+            const anonymousUserData = currentQuizSession.userScores[anonymousDbUserId];
+            currentQuizSession.userScores[authenticatedDbUserId] = {
+                ...anonymousUserData,
+                score: 0,
+            };
+        }
+        currentQuizSession.userScores[authenticatedDbUserId].score += anonymousScore;
+        delete currentQuizSession.userScores[anonymousDbUserId];
+    }
+
+    if (currentQuizSession.currentQuestion && currentQuizSession.currentQuestion.answers[anonymousDbUserId]) {
+        const answerData = currentQuizSession.currentQuestion.answers[anonymousDbUserId];
+        currentQuizSession.currentQuestion.answers[authenticatedDbUserId] = answerData;
+        delete currentQuizSession.currentQuestion.answers[anonymousDbUserId];
+    }
+}
+
 const findOrCreateUser = async (twitchUserId, displayName) => {
-    // First, try to find the user
+    // This function now primarily deals with authenticated users.
     let userResult = await db.query('SELECT id FROM users WHERE twitch_user_id = $1', [twitchUserId]);
 
     if (userResult.rows.length > 0) {
-        // User found, update display_name in case it changed, and return user
         const user = userResult.rows[0];
         await db.query('UPDATE users SET display_name = $1 WHERE id = $2', [displayName, user.id]);
         return user;
     } else {
-        // If not found, create a new user
         const newUserResult = await db.query(
             'INSERT INTO users(twitch_user_id, display_name) VALUES($1, $2) RETURNING id',
             [twitchUserId, displayName]
         );
-        const newUser = newUserResult.rows[0];
-        console.log(`New user created: ${displayName} (Twitch ID: ${twitchUserId})`);
-        return newUser;
+        return newUserResult.rows[0];
     }
 };
 
@@ -653,35 +767,81 @@ io.on("connection", (socket) => {
     socket.on('submit-answer', async (data) => {
         const { questionId, selectedOption, responseTime, twitchUserId } = data;
 
+        // --- Validations ---
         if (responseTime === 0 || selectedOption === -1) {
             return;
         }
-
-        // --- Validations ---
         if (!currentQuizSession.quizId || !currentQuizSession.currentQuestion || currentQuizSession.currentQuestion.id !== questionId) {
             return; // Answer is not for the current question, or no quiz/question active, ignore.
         }
 
-        // Fetch display name from Twitch API first
-        const displayName = await getTwitchDisplayName(twitchUserId);
+        // --- User Identification and Merging Logic ---
+        const isAnonymous = typeof twitchUserId === 'string' && twitchUserId.startsWith('U');
+        const socketId = socket.id;
+        let session = socketUserMap.get(socketId);
+        let dbUserId;
+        let finalDisplayName;
 
-        // Find or create the user with their display name
-        const user = await findOrCreateUser(twitchUserId, displayName);
-        if (!user) return; // Should not happen
+        // Fetch real display name if not anonymous
+        const realDisplayName = isAnonymous ? null : await getTwitchDisplayName(twitchUserId);
 
-        // Check if user has already answered this question in memory
-        if (currentQuizSession.currentQuestion.answers[user.id]) {
+        if (session) { // User has an existing session on this socket
+            dbUserId = session.dbUserId;
+            finalDisplayName = (await db.query('SELECT display_name FROM users WHERE id = $1', [dbUserId])).rows[0].display_name;
+
+            // --- MERGE SCENARIO ---
+            // Check if a previously anonymous user has now authenticated
+            if (session.isAnonymous && !isAnonymous) {
+                console.log(`User with socket ${socketId} has authenticated. Merging...`);
+                const authUser = await findOrCreateUser(twitchUserId, realDisplayName);
+
+                // Perform the merge if the DB IDs are different
+                if (session.dbUserId !== authUser.id) {
+                    await mergeUsers(session.dbUserId, authUser.id);
+                    mergeInMemoryData(session.dbUserId, authUser.id);
+                }
+
+                // Release the anonymous number
+                usedAnonymousNumbers.delete(session.anonymousNumber);
+                nextAnonymousNumber = Math.min(nextAnonymousNumber, session.anonymousNumber);
+
+                // Update the session to reflect authenticated state
+                session.isAnonymous = false;
+                session.dbUserId = authUser.id;
+                session.anonymousNumber = null;
+                socketUserMap.set(socketId, session);
+
+                dbUserId = authUser.id;
+                finalDisplayName = realDisplayName;
+                console.log(`Merge complete for ${realDisplayName}.`);
+            }
+        } else { // First answer from this user on this socket
+            if (isAnonymous) {
+                const { dbUserId: anonDbUserId, displayName: anonDisplayName, anonymousNumber } = await createAnonymousUser(twitchUserId);
+                dbUserId = anonDbUserId;
+                finalDisplayName = anonDisplayName;
+                socketUserMap.set(socketId, { dbUserId, isAnonymous: true, anonymousNumber });
+            } else {
+                const authUser = await findOrCreateUser(twitchUserId, realDisplayName);
+                dbUserId = authUser.id;
+                finalDisplayName = realDisplayName;
+                socketUserMap.set(socketId, { dbUserId, isAnonymous: false, anonymousNumber: null });
+            }
+        }
+
+        // Check if user has already answered this question
+        if (currentQuizSession.currentQuestion.answers[dbUserId]) {
             return; // User already answered, ignore.
         }
 
-        // Store answer in memory for quick processing at the end of the round
-        currentQuizSession.currentQuestion.answers[user.id] = {
+        // Store answer in memory for quick processing
+        currentQuizSession.currentQuestion.answers[dbUserId] = {
             selectedOption,
             responseTime,
-            twitchUserId, // Keep this for the leaderboard response
-            displayName // Also store displayName for potential future use
+            twitchUserId, // Keep original twitchUserId for this answer
+            displayName: finalDisplayName
         };
-        currentQuizSession.currentQuestion.receivedAnswerCount++; // Increment received answer count
+        currentQuizSession.currentQuestion.receivedAnswerCount++;
 
         // --- Real-time update for control panel ---
         if (currentQuizSession.currentQuestion) {
@@ -689,14 +849,27 @@ io.on("connection", (socket) => {
                 currentQuizSession.currentQuestion.answers,
                 currentQuizSession.currentQuestion.correct_option
             );
+
+            // Calculate vote counts
+            const voteCounts = { 0: 0, 1: 0, 2: 0, 3: 0, '-1': 0 };
+            for (const userId in currentQuizSession.currentQuestion.answers) {
+                const selectedOption = currentQuizSession.currentQuestion.answers[userId].selectedOption;
+                if (voteCounts.hasOwnProperty(selectedOption)) {
+                    voteCounts[selectedOption]++;
+                }
+            }
+
             if (controlPanelSocketId) {
-                io.to(controlPanelSocketId).emit("live-round-update", { roundResults: liveResults });
+                io.to(controlPanelSocketId).emit("live-round-update", {
+                    roundResults: liveResults,
+                    voteCounts: voteCounts
+                });
             } else {
                 console.warn("Control Panel not registered. Cannot send live-round-update.");
             }
         }
 
-        console.log(`Answer received from ${displayName} (Twitch: ${twitchUserId}). Answers received: ${currentQuizSession.currentQuestion.receivedAnswerCount}/${currentQuizSession.currentQuestion.expectedAnswerCount}`);
+        console.log(`Answer received from ${finalDisplayName} (Twitch: ${twitchUserId}). Answers received: ${currentQuizSession.currentQuestion.receivedAnswerCount}/${currentQuizSession.currentQuestion.expectedAnswerCount}`);
 
         // Log when all expected answers have been received
         if (currentQuizSession.currentQuestion.receivedAnswerCount >= currentQuizSession.currentQuestion.expectedAnswerCount) {
@@ -706,6 +879,17 @@ io.on("connection", (socket) => {
 
     socket.on("disconnect", () => {
         console.log(`Client disconnected: ${socket.id}`);
+
+        // --- User Session Cleanup ---
+        const session = socketUserMap.get(socket.id);
+        if (session && session.isAnonymous) {
+            usedAnonymousNumbers.delete(session.anonymousNumber);
+            nextAnonymousNumber = Math.min(nextAnonymousNumber, session.anonymousNumber);
+            console.log(`Released anonymous number ${session.anonymousNumber}. Next available: ${nextAnonymousNumber}`);
+        }
+        socketUserMap.delete(socket.id);
+        // --- End User Session Cleanup ---
+
         if (socket.id === controlPanelSocketId) {
             controlPanelSocketId = null;
             console.log("Control Panel disconnected. controlPanelSocketId cleared.");
@@ -723,6 +907,9 @@ io.on("connection", (socket) => {
 
 // --- Server Initialization ---
 const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => console.log(`✅ Backend running on port ${PORT}`));
+server.listen(PORT, () => {
+    console.log(`✅ Backend running on port ${PORT}`);
+    initializeAnonymousUserTracking();
+});
 
 module.exports = { app, server };
