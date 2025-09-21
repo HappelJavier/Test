@@ -764,6 +764,31 @@ io.on("connection", (socket) => {
     });
 
 
+    // --- Merge user event: opaqueId -> realUserId ---
+    socket.on('merge-user', async ({ opaqueId, realUserId }) => {
+        try {
+            if (!opaqueId || !realUserId) return;
+            // Buscar usuarios en la base de datos
+            const anonUserRes = await db.query('SELECT id FROM users WHERE twitch_user_id = $1', [opaqueId]);
+            const realUserRes = await db.query('SELECT id FROM users WHERE twitch_user_id = $1', [realUserId]);
+            if (anonUserRes.rows.length === 0 || realUserRes.rows.length === 0) {
+                console.log(`merge-user: No se encontraron ambos usuarios (opaqueId: ${opaqueId}, realUserId: ${realUserId})`);
+                return;
+            }
+            const anonDbUserId = anonUserRes.rows[0].id;
+            const realDbUserId = realUserRes.rows[0].id;
+            if (anonDbUserId === realDbUserId) {
+                console.log('merge-user: Los IDs ya son iguales, nada que fusionar.');
+                return;
+            }
+            await mergeUsers(anonDbUserId, realDbUserId);
+            mergeInMemoryData(anonDbUserId, realDbUserId);
+            console.log(`merge-user: Datos fusionados de ${opaqueId} -> ${realUserId}`);
+        } catch (err) {
+            console.error('merge-user: Error al fusionar usuarios:', err);
+        }
+    });
+
     socket.on('submit-answer', async (data) => {
         const { questionId, selectedOption, responseTime, twitchUserId } = data;
 
