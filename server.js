@@ -716,8 +716,17 @@ async function mergeUsers(anonymousDbUserId, authenticatedDbUserId) {
     }
 }
 
-function mergeInMemoryData(anonymousDbUserId, authenticatedDbUserId) {
+async function mergeInMemoryData(anonymousDbUserId, authenticatedDbUserId) {
     console.log(`Merging in-memory data for user ID ${anonymousDbUserId} into ${authenticatedDbUserId}`);
+    // Obtener el displayName actualizado del usuario autenticado
+    let newDisplayName = null;
+    try {
+        const res = await db.query('SELECT display_name FROM users WHERE id = $1', [authenticatedDbUserId]);
+        if (res.rows.length > 0) newDisplayName = res.rows[0].display_name;
+    } catch (e) {
+        console.error('Error fetching displayName for merge:', e);
+    }
+
     if (currentQuizSession.userScores[anonymousDbUserId]) {
         const anonymousScore = currentQuizSession.userScores[anonymousDbUserId].score || 0;
         if (!currentQuizSession.userScores[authenticatedDbUserId]) {
@@ -725,15 +734,23 @@ function mergeInMemoryData(anonymousDbUserId, authenticatedDbUserId) {
             currentQuizSession.userScores[authenticatedDbUserId] = {
                 ...anonymousUserData,
                 score: 0,
+                displayName: newDisplayName || anonymousUserData.displayName
             };
         }
         currentQuizSession.userScores[authenticatedDbUserId].score += anonymousScore;
+        // Actualizar el displayName si ya existía
+        if (newDisplayName) {
+            currentQuizSession.userScores[authenticatedDbUserId].displayName = newDisplayName;
+        }
         delete currentQuizSession.userScores[anonymousDbUserId];
     }
 
     if (currentQuizSession.currentQuestion && currentQuizSession.currentQuestion.answers[anonymousDbUserId]) {
         const answerData = currentQuizSession.currentQuestion.answers[anonymousDbUserId];
-        currentQuizSession.currentQuestion.answers[authenticatedDbUserId] = answerData;
+        currentQuizSession.currentQuestion.answers[authenticatedDbUserId] = {
+            ...answerData,
+            displayName: newDisplayName || answerData.displayName
+        };
         delete currentQuizSession.currentQuestion.answers[anonymousDbUserId];
     }
 }
