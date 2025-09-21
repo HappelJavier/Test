@@ -669,6 +669,17 @@ async function findNextAvailableAnonymousNumber() {
 }
 
 async function createAnonymousUser(twitchUserId) {
+    // Verificar si ya existe
+    const existing = await db.query('SELECT id, display_name FROM users WHERE twitch_user_id = $1', [twitchUserId]);
+    if (existing.rows.length > 0) {
+        // Ya existe, devolver el usuario existente
+        return {
+            dbUserId: existing.rows[0].id,
+            displayName: existing.rows[0].display_name,
+            anonymousNumber: parseInt(existing.rows[0].display_name.replace('User ', ''), 10) || null,
+        };
+    }
+
     const anonymousNumber = await findNextAvailableAnonymousNumber();
     const displayName = `User ${anonymousNumber}`;
 
